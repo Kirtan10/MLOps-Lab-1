@@ -168,4 +168,4 @@ cython_debug/
 model.joblib
 
 # Ignore steps.txt file
-steps.txt
+steps.txt.DS_Store

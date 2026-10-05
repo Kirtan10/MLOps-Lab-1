@@ -1,195 +1,165 @@
-# CI/CD with GitHub Actions and GCP - Intermediate Lab
+# CI/CD for ML with GitHub Actions and GCP: Logistic Regression and Metrics Tracking
 
-This repository is a hands-on lab designed to teach you how to set up a CI/CD pipeline for a machine learning project using GitHub Actions and Google Cloud Platform (GCP). You'll learn how to train a model, version it, and deploy it using Docker containers on GCP.
+This project is a modified version of [Lab 4 (GitHub Labs)](https://github.com/raminmohammadi/MLOps/tree/main/Labs/Github_Labs/Lab4) from the MLOps course repository. It builds a CI/CD pipeline that, on every push to `main`, tests the code, trains a model, versions it in Google Cloud Storage, records its evaluation metrics, and packages it as a Docker image in Google Artifact Registry.
 
----
-## Learning Objectives
-By completing this lab, you will:
-- Set up a GitHub repository with automated CI/CD using GitHub Actions for an ML project.
-- Configure and use Google Cloud Platform (GCP) services for ML operations, including Google Cloud Storage (GCS) and Artifact Registry.
-- Develop a GitHub Actions workflow that automates the entire process from testing to deploying a containerized ML model.
-- Learn how to use MagicMock and patch for effectively testing functions that interact with GCP services.
+## What I changed from the original lab
 
+| Area | Original lab | This version |
+|---|---|---|
+| Model | `RandomForestClassifier` | `Pipeline` of `StandardScaler` + `LogisticRegression` |
+| Evaluation | Accuracy only, printed to the console | Accuracy, macro precision, macro recall and macro F1 |
+| Metrics storage | Not saved | A JSON metrics record is uploaded to GCS for every model version |
+| Tests | 7 tests, one of which passed by accident | 9 tests, including new tests for evaluation and metrics upload, and a fixed versioning test |
+| Workflow | Written for the monorepo; several bugs | Adapted to a standalone repo, bugs fixed |
 
----
+### 1. Logistic Regression instead of Random Forest
 
-### Step 1: Fork and Clone the Repository
-First, you need to clone this repository onto your local machine. Then, Create a new repository in your GitHub account. Do not initialize it with a README, .gitignore, or license. Then you need to update the remote URL of your local repository to point to your new GitHub repository:
+`train_model()` now returns a scikit-learn `Pipeline` with two steps: a `StandardScaler` followed by `LogisticRegression(max_iter=1000)`.
 
-You can do so by the following command:
-```bash
-git remote set-url origin https://github.com/[your-username]/[your-new-repo-name].git
-```
-Now, push the cloned codes to new repository using below command:
-```bash
-git push -u origin main
-```
-Now you have a copy of the project in your own GitHub account. In the next steps, we'll set up the GCP project and configure the necessary credentials.
+Logistic Regression is sensitive to the scale of its input features, whereas tree-based models like Random Forest are not. Standardizing the features helps the solver converge and keeps any single feature from dominating the coefficients. Because the scaler is part of the pipeline, it is saved inside the same `.joblib` file as the classifier, so any code that loads the model later applies exactly the same scaling automatically.
 
-### Step 2: Setting up GCP and Configuring Credentials
+### 2. Richer evaluation and metrics tracking
 
-1. Create a new project on GCP console.
-2. Enable the following APIs in your GCP project: Cloud Storage, Cloud Build, Artifact Registry
-3. Create a service account in your GCP project with the following roles:
-- Storage Admin
-- Storage Object Admin
-- Artifact Registry Administrator
+A new `evaluate_model()` function returns four metrics: accuracy, precision, recall and F1. Precision, recall and F1 use macro averaging, which gives each of the three Iris classes equal weight.
 
-4. Generate a JSON key for the service account and download it.
-5. Create a GCS bucket in your GCP project with a unique name. (we have done this step in the beginner lab, please refer to that one for more guidance)
-6. In your GitHub repository, go to Settings > Secrets and variables > Actions.
-7. Add the following repository secrets:
-- `GCP_SA_KEY`: The entire content of the JSON key file you downloaded.
-- `GCP_PROJECT_ID`: Your GCP project ID.
-- `GCS_BUCKET_NAME`: The name of the GCS bucket you created in the previous step which we will use to store the model and version file.
-- `VERSION_FILE_NAME`: The name of the file that will store the model version (e.g., "model_version.txt").
+A new `save_metrics_to_gcs()` function uploads a JSON record for each run to `metrics/metrics_v{N}_{timestamp}.json` in the bucket. Each record links the scores to a specific model version and file, so you can look back and see how every version performed:
 
-
-8. Create an Artifact Registry repository in your GCP project: You can either go to Artifact Registry service of GCP, and create a new repository through GCP UI, or you can do it through `gcloud` command. However, for doing through gcloud, you need to install Google SDK on your machine, and also authenticate your account, and also set the new created project as the active project. you can create the repository by the following command:
-```bash
-gcloud artifacts repositories create my-repo --repository-format=docker --location=us-east4
+```json
+{
+  "model_version": 3,
+  "model_type": "LogisticRegression (with StandardScaler)",
+  "dataset": "iris",
+  "timestamp": "20261005143210",
+  "model_path": "gs://<bucket>/trained_models/model_v3_20261005143210.joblib",
+  "metrics": {
+    "accuracy": 1.0,
+    "precision_macro": 1.0,
+    "recall_macro": 1.0,
+    "f1_macro": 1.0
+  }
+}
 ```
 
-These steps set up your GCP environment and configure the necessary credentials for the GitHub Actions workflow to interact with GCP services.
+(Iris is a small, easily separable dataset, so perfect test scores are expected here.)
 
-### Step 3: Local Development Setup
-For local development and testing the script, first we need to create a virtual environment by following commands:
+### 3. Updated and extended tests
+
+Here is what changed in `test/test_pytest.py`:
+
+- **`test_train_model`** now checks that the model is a `Pipeline` containing a `StandardScaler` and a `LogisticRegression`. Its sample data now contains two classes, because Logistic Regression cannot be fitted on data with only one class (Random Forest can, which is why the original sample data used a single class).
+- **`test_save_model_to_gcs`** now saves a trained Logistic Regression pipeline.
+- **`test_evaluate_model`** (new) checks that all four metrics are returned as floats between 0 and 1, and that accuracy on Iris is at least 0.9.
+- **`test_save_metrics_to_gcs`** (new) uses `MagicMock` to capture the uploaded content. It checks that the content is valid JSON matching the input and is sent with the `application/json` content type, and that an upload failure returns `False` instead of raising.
+- **`test_get_model_version`** contained a bug, which I fixed. The original test set the mocked `download_as_text` return value *after* calling the function. It only passed because `int()` of a `MagicMock` happens to return `1`, the expected value. The mock is now configured before the call and returns `'3'`, so the test really proves that the version is read from the blob.
+
+### 4. Workflow fixes
+
+The original workflow was written to run from inside the course monorepo. I made these changes so it works as a standalone repo:
+
+- I removed `working-directory: Labs/Github_Labs/Lab4/` and fixed the `requirements.txt` path in the cache key.
+- I renamed the secret `GCP_SA_KEY2` to `GCP_SA_KEY`, to match the documented setup.
+- I changed `secrets.REGION` to `env.REGION` in the image name. No such secret existed, so the image path started with `-docker.pkg.dev`.
+- The Docker image is now tagged with `env.MODEL_VERSION` instead of `env.VERSION_FILE_NAME`. The latter is empty in that step, so the version tag was blank.
+- I aligned the region and repository name with the setup instructions (`us-east4`, `my-repo`).
+- I removed the nightly `cron` schedule, so the pipeline does not retrain and push a new image every day. It can still be run manually with `workflow_dispatch`.
+- I upgraded `google-github-actions/setup-gcloud` from v1 to v2.
+
+## How the pipeline works
+
+On every push or pull request to `main`, `.github/workflows/ci_cd_pipeline.yml` runs these steps:
+
+1. Checks out the code, sets up Python 3.10, and installs dependencies (with pip caching).
+2. Runs the test suite with `pytest`. If any test fails, the pipeline stops here.
+3. Authenticates to GCP with a service account key stored in GitHub Secrets.
+4. Runs `src/train_and_save_model.py`, which:
+   - reads the current version from `model_version.txt` in GCS and increments it
+   - trains the Logistic Regression pipeline on Iris and evaluates it
+   - uploads the model to `trained_models/` and the metrics to `metrics/`
+   - writes the new version number back to GCS
+5. Builds a Docker image and pushes it to Artifact Registry, tagged with both the version number and `latest`.
+
+Resulting bucket layout:
+
+```
+<bucket>/
+├── model_version.txt
+├── trained_models/
+│   ├── model_v1_<timestamp>.joblib
+│   └── model_v2_<timestamp>.joblib
+└── metrics/
+    ├── metrics_v1_<timestamp>.json
+    └── metrics_v2_<timestamp>.json
+```
+
+## Project structure
+
+```
+.
+├── .github/workflows/ci_cd_pipeline.yml   # CI/CD workflow
+├── src/train_and_save_model.py            # Training, evaluation, versioning, GCS upload
+├── test/test_pytest.py                    # Unit tests (GCS calls mocked)
+├── Dockerfile                             # Packages the trained model
+├── Mock.md                                # Notes on MagicMock and patch
+└── requirements.txt
+```
+
+## Setup
+
+### GCP
+
+1. Create a GCP project and enable the **Cloud Storage**, **Cloud Build** and **Artifact Registry** APIs.
+2. Create a service account with the **Storage Admin**, **Storage Object Admin** and **Artifact Registry Administrator** roles, and download a JSON key for it.
+3. Create a GCS bucket.
+4. Create a Docker repository in Artifact Registry named `my-repo` in `us-east4`:
+   ```bash
+   gcloud artifacts repositories create my-repo --repository-format=docker --location=us-east4
+   ```
+
+### GitHub Secrets
+
+In **Settings → Secrets and variables → Actions**, add:
+
+| Secret | Value |
+|---|---|
+| `GCP_SA_KEY` | Full contents of the service account JSON key |
+| `GCP_PROJECT_ID` | Your GCP project ID |
+| `GCS_BUCKET_NAME` | Your bucket name |
+| `VERSION_FILE_NAME` | `model_version.txt` |
+
+### Local development
+
 ```bash
-# Creating a virtual environment
-python -m venv venv
-
-# Activating the environment
+python3 -m venv venv
 source venv/bin/activate
-
-# Install required dependencies for this project
 pip install -r requirements.txt
+
+# Run the tests (no GCP access needed; storage calls are mocked)
+pytest test/ -v
 ```
-Now, we need to create `.env` file for storing environmental variables which will be used to load `GCS_BUCKET_NAME` and `VERSION_FILE_NAME` by the `dotenv` library in `train_and_save_model.py`.
-```bash
-# This is inside .env file
+
+To run the training script locally, create a `.env` file:
+
+```
 GCS_BUCKET_NAME=your-bucket-name
 VERSION_FILE_NAME=model_version.txt
 ```
 
-Replace your-bucket-name with the name of the GCS bucket you created earlier.
+Then point to your service account key and run the script:
 
-In order to interact with GCP services locally, we need to set the `GOOGLE_APPLICATION_CREDENTIALS` environment variable to point to the JSON key file:
 ```bash
-export GOOGLE_APPLICATION_CREDENTIALS="/path/to/your/service-account-key.json"
+export GOOGLE_APPLICATION_CREDENTIALS="/path/to/your/key.json"
+python src/train_and_save_model.py
 ```
 
-(Optional) If you want to use the gcloud CLI as well:
+Never commit `.env` or the JSON key. Both are excluded by `.gitignore`.
 
-If you haven't already, install the [Google Cloud SDK](https://cloud.google.com/sdk/docs/install). After installing Google Cloud SDK, do the following commands:
- ```bash
- # Authenticate with your Google Cloud account
- gcloud auth application-default login
+## Verifying a run
 
- # Set your project ID
- gcloud config set project your-project-id
- ```
- #### Running the Model Training Script
- To run the model training script locally:
- ```bash
- python train_and_save_model.py
- ```
+After the workflow succeeds:
 
- After running this script locally, there should be a `trained_models` and `model_version.txt` in your GCS bucket. If you run it one more time, the new model would be uploaded and also the model version increments by one.
- 
-This is a simple model script which we have also used in the previous beginner lab. This script includes following fucntions which will form our machine learning pipeline:
-- Download the Iris dataset
-- Preprocess the data
-- Train a Random Forest model
-- Evaluate the model's accuracy
-- Save the model to your local machine and to Google Cloud Storage
-- Update the model version in GCS
+- **Cloud Storage → your bucket** contains the new model in `trained_models/`, its metrics JSON in `metrics/`, and an incremented `model_version.txt`.
+- **Artifact Registry → my-repo → model-image** shows an image tagged with the new version number and `latest`.
 
-The train_and_save_model.py script contains several key functions:
+## Credits
 
-- `download_data()`: Downloads the Iris dataset.
-- `preprocess_data()`: Splits the data into training and testing sets.
-- `train_model()`: Trains a Random Forest classifier.
-- `get_model_version()`: Retrieves the current model version from GCS.
-- `update_model_version()`: Updates the model version in GCS.
-- `save_model_to_gcs()`: Saves the trained model to both the local filesystem and GCS.
-
-The main() function orchestrates the entire process, from data download to model saving and version updating.
-
-Review the code comments for more detailed explanations of each function.
-
-### Step 4: GitHub Actions Workflow
-This project includes a GitHub Actions workflow that automates the process of training the model, building a Docker image, and pushing it to Google Cloud Artifact Registry.
-
-Key Steps in the Workflow: 
-
-- Checkout code: Uses `actions/checkout@v4` to clone the repository.
-- Set up Python: Uses `actions/setup-python@v5` to set up Python 3.10.
-- Cache dependencies: Uses `actions/cache@v4` to cache pip dependencies.
-- Install dependencies: Installs the required Python packages from requirements.txt.
-- Run tests: Executes the test functions using pytest.
-- Authenticate with GCP: Uses `google-github-actions/auth@v2` to authenticate with Google Cloud Platform using the service account key stored in GitHub Secrets.
-- Set up Cloud SDK: Uses `google-github-actions/setup-gcloud@v1` to set up the Google Cloud SDK.
-- Train and save model: Runs the `train_and_save_model.py` script, which trains the model and saves it to GCS. It also extracts the model version for use in later steps.
-- Build and Push Docker image: Builds a Docker image containing the trained model and pushes it to Google Cloud Artifact Registry. The image is tagged with both the model version and 'latest'.
-
-The Docker build and push process is a crucial part of the workflow. 
-```yaml
-- name: Build and Push Docker image
-  env:
-    IMAGE_NAME: ${{ env.REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.REPOSITORY_NAME }}/model-image
-  run: |
-    docker build -t ${IMAGE_NAME}:${{ env.MODEL_VERSION }} .
-    docker push ${IMAGE_NAME}:${{ env.MODEL_VERSION }}
-    docker tag ${IMAGE_NAME}:${{ env.MODEL_VERSION }} ${IMAGE_NAME}:latest
-    docker push ${IMAGE_NAME}:latest
-```
-Here's what each command does:
-
-- `docker build -t ${IMAGE_NAME}:${{ env.MODEL_VERSION }} .`
-
-Builds a Docker image using the Dockerfile in the current directory (.).
-Tags the image with the Artifact Registry repository path and the current model version (which is extracted using previous step using `grep` command).
-
-
-- `docker push ${IMAGE_NAME}:${{ env.MODEL_VERSION }}`
-
-Pushes the image with the version tag to the Artifact Registry.
-
-
-- `docker tag ${IMAGE_NAME}:${{ env.MODEL_VERSION }} ${IMAGE_NAME}:latest`
-
-Creates a new tag latest for the same image.
-This allows users to always pull the most recent version using the latest tag.
-
-
-- `docker push ${IMAGE_NAME}:latest`
-
-Pushes the image with the latest tag to the Artifact Registry.
-
-
-
-The `$IMAGE_NAME` environment variable is constructed using:
-
-- `${{ env.REGION }}`: The GCP region (us-east4)
-- `${{ secrets.GCP_PROJECT_ID }}`: Your GCP project ID (stored in GitHub Secrets)
-- `${{ env.REPOSITORY_NAME }}`: The Artifact Registry repository name (`my-repo`)
-
-
-This process ensures that each model version is uniquely tagged and pushed to the Artifact Registry, while also maintaining a latest tag that always points to the most recent version.
-
-### Step 3: Monitor the GitHub Actions Workflow
-If you've made any changes to the code or configuration files, commit them to your local repository and push to GitHub:
-```bash
-git add .
-git commit -m "Completed MLOps Intermediate Lab setup"
-git push origin main
-```
-If you haven't made any changes, then you can create an empty commit by the following command and push it to the remote repo to trigger the workflow:
-```bash
-git commit --allow-empty -m "Trigger the pipeline by an empty commit"
-
-git push
-```
-Once the workflow completes successfully, verify the results in your Google Cloud Console by going to Artifact Registry and look for `my-repo` repository. You should see your Docker image with two tags, 
-
-a specific version number (e.g., `1, 2, 3`, etc.) and the `latest` tag.
+This project is based on Lab 4 of the GitHub Labs in [raminmohammadi/MLOps](https://github.com/raminmohammadi/MLOps).
